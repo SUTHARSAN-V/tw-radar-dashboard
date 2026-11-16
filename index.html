@@ -194,7 +194,7 @@
 
     <div class="card">
       <div class="card-accent"></div>
-      <div class="card-title">RADAR OCCUPANCY REGION (CONFIG)</div>
+      <div class="card-title">BED ZONE — RADAR CONFIG</div>
       <div class="card-sep"></div>
       <div class="card-body">
         <div class="row"><label>State</label><span class="val" id="roiStatus">Waiting for config/state</span></div>
@@ -202,6 +202,7 @@
         <div class="row"><label>Y range</label><span class="val" id="roiWidth">—</span></div>
         <div class="row"><label>Enabled</label><span class="val" id="roiHeight">—</span></div>
         <div class="row"><label>Floor Z</label><span class="val" id="roiGround">—</span></div>
+        <div class="hint" style="margin-top:10px;">Bed geometry uses the verified ESP32 legacy MQTT configuration order: [enable, X min, X max, Y min, Y max, floor Z]. Zone labels are received directly from radar MQTT.</div>
       </div>
     </div>
 
@@ -226,7 +227,8 @@
       <div class="card-body">
         <div class="legend-item"><span class="legend-swatch dot" style="background:#F4C95D"></span>Human figure (by posture)</div>
         <div class="legend-item"><span class="legend-swatch" style="background:#F4C95D"></span>Track History</div>
-        <div class="legend-item"><span class="legend-swatch box" style="border-color:#FF9F1C"></span>Illustrative bed (not radar-detected)</div>
+        <div class="legend-item"><span class="legend-swatch box" style="border-color:#FF9F1C"></span>Configured bed zone (illustrative shape)</div>
+        <div class="legend-item"><span class="legend-swatch box" style="border-color:#22D3EE"></span>Radar tracking boundary (default CFG)</div>
       </div>
     </div>
     <div class="card">
@@ -251,7 +253,8 @@
       <div class="chip"><span class="chip-dot" style="background:#0f9c8f"></span>Walking</div>
       <div class="chip"><span class="chip-dot" style="background:#c62828"></span>Fall</div>
       <div class="chip"><span class="chip-line" style="background:#F4C95D"></span>Track History</div>
-      <div class="chip"><span class="chip-box" style="border-color:#FF9F1C"></span>Illustrative Bed</div>
+      <div class="chip"><span class="chip-box" style="border-color:#FF9F1C"></span>Configured Bed Zone</div>
+      <div class="chip"><span class="chip-box" style="border-color:#22D3EE"></span>Radar Boundary (8 × 8 m, default)</div>
       <div style="flex:1;"></div>
       <button id="calibToggleBtn" class="secondary" style="display:none; padding:4px 10px; font-size:11px;" aria-hidden="true" tabindex="-1">Calibration unavailable</button>
     </div>
@@ -327,21 +330,22 @@ const NO_PATIENT = {bg:"#f0f2f5", fg:"#68727d", label:"● NO PATIENT"};
 
 let client = null;
 let tracks = {};       // accepted/displayed tracks only
-let bedRoi = null;     // no bed ROI is published by latest firmware; 3D bed is illustrative only
-let liveOccupancy = null; // six values from TW_RADAR.OCCUPANCY, received on /config/state
+// Bed geometry is a visual representation of TW_RADAR.OCCUPANCY, not a detected bed.
+let liveOccupancy = null; // canonical order: [enabled, xMin, yMin, xMax, yMax, floorZ]
+let rawOccupancy = null; // exactly as received from /config/state
 let readerHealth = null;
 let rxPacketCount = 0;
 let selectedTid = null;
 
 // TID/GID identity lock:
 // 1) The first valid TID/GID is shown immediately.
-// 2) Other GIDs are held as candidates for 30 s.
-// 3) A candidate is accepted only if it remains continuously present for 30 s.
+// 2) Other GIDs are held as candidates for 20 s.
+// 3) A candidate is accepted only if it remains continuously present for 20 s.
 // 4) If it disappears before 30 s, it is discarded and the existing patient remains.
 // 5) Once accepted, additional valid GIDs may also be displayed.
 // 6) When an accepted TID disappears, its old GID mapping is deleted;
 //    if it returns later, it must pass the full 20-second validation again.
-// 7) A STANDING/WALKING track with frozen XYZ for 5 s is removed as stale.
+// 7) A STANDING/WALKING track with frozen XYZ for 2 s is removed as stale.
 //    if it returns later, it must pass the full 20-second validation again.
 // 6) The original TID remains the identity for the original GID.
 const TRACK_LOCK_MS = 20000;
@@ -351,7 +355,7 @@ const POSTURE_LOCK_MS = 10000;
 
 // Frozen-track watchdog:
 // If an accepted STANDING/WALKING track keeps receiving packets but its XYZ
-// position is effectively unchanged, treat it as stale/ghost data.
+// position is effectively unchanged for 2 s, treat it as stale/ghost data.
 // Small real radar variation is allowed.
 const FROZEN_TRACK_MS = 2000;
 const FROZEN_POSITION_EPS_M = 0.01; // 1 cm per axis
@@ -446,6 +450,8 @@ function resetRealtime() {
   for (const k in pendingGids) delete pendingGids[k];
   for (const k in pendingPostures) delete pendingPostures[k];
   liveOccupancy = null;
+  rawOccupancy = null;
+  if (scene) updateBedMesh();
   readerHealth = null;
   rxPacketCount = 0;
   els.packetCount.textContent = '0';
@@ -538,9 +544,13 @@ function connect() {
       else { readerHealth = msg; updateCalibCard(); }
     } else if (topic === prefix + '/config/state') {
       const c = msg.TW_RADAR && msg.TW_RADAR.OCCUPANCY;
-      if (Array.isArray(c) && c.length === 6 && c.every(v=>typeof v === 'number' && Number.isFinite(v))) liveOccupancy = c;
-      els.configState.textContent = 'Received';
-      updateRoiCard();
+      if (Array.isArray(c) && c.length === 6 && c.every(v => typeof v === 'number' && Number.isFinite(v))) {
+        rawOccupancy = c.slice();
+        refreshBedFromConfig();
+      } else {
+        // Preserve the most recently received valid settings on partial state messages.
+        els.configState.textContent = 'No occupancy config in message';
+      }
     } else if (topic === prefix + '/config/ack') {
       showConfigAck(msg);
     }
@@ -661,7 +671,7 @@ function onTrackMessage(msg) {
 
   // FIRST VALID PATIENT:
   // Lock the first valid GID/TID immediately and ignore other identities
-  // until they pass the 30-second validation window.
+  // until they pass the 20-second validation window.
   if (primaryGid === null) {
     primaryGid = gid;
     primaryTid = tid;
@@ -702,7 +712,7 @@ function onTrackMessage(msg) {
     if (!p.tid) p.tid = tid;
   }
 
-  // Candidate must remain continuously alive for 30 seconds.
+  // Candidate must remain continuously alive for 20 seconds.
   if ((now - p.firstSeen) >= TRACK_LOCK_MS) {
     const acceptedTid = p.tid;
     acceptedGids[gid] = acceptedTid;
@@ -721,7 +731,7 @@ function onTrackMessage(msg) {
 
 // Remove accepted tracks that have disappeared.
 // Pending candidates are removed immediately when they stop sending;
-// if they return later, their 30-second validation starts again.
+// if they return later, their 20-second validation starts again.
 setInterval(() => {
   const now = Date.now();
   let changed = false;
@@ -782,15 +792,32 @@ setInterval(() => {
   if (changed) renderAll();
 }, 1000);
 
+// TrackerWave deployed ESP32 legacy MQTT workaround (single supported mode):
+// The stored OCCUPANCY array is [enable, xMin, xMax, yMin, yMax, floorZ].
+// Convert it to canonical drawing coordinates [enable, xMin, yMin, xMax, yMax, floorZ].
+// This conversion affects bed ILLUSTRATION ONLY. Trust the radar-provided MQTT zone.
+function normalizeOccupancy(raw) {
+  if (!Array.isArray(raw) || raw.length !== 6 || !raw.every(v => typeof v === 'number' && Number.isFinite(v))) return null;
+  const c = [raw[0], raw[1], raw[3], raw[2], raw[4], raw[5]];
+  return ((c[0] === 0 || c[0] === 1) && c[1] < c[3] && c[2] < c[4]) ? c : null;
+}
+function refreshBedFromConfig() {
+  liveOccupancy = normalizeOccupancy(rawOccupancy);
+  if (rawOccupancy && !liveOccupancy) els.configState.textContent = 'Invalid legacy bed config';
+  else if (liveOccupancy) els.configState.textContent = 'Received';
+  updateRoiCard();
+  if (scene) updateBedMesh();
+}
+
 function updateRoiCard() {
   const roi = liveOccupancy;
   if (!roi) {
-    els.roiStatus.textContent = 'Waiting for config/state';
+    els.roiStatus.textContent = 'Waiting for bed config';
     els.roiLength.textContent = '—'; els.roiWidth.textContent = '—';
     els.roiHeight.textContent = '—'; els.roiGround.textContent = '—';
     return;
   }
-  els.roiStatus.textContent = 'Loaded';
+  els.roiStatus.textContent = roi[0] === 1 ? 'Configured / enabled' : 'Configured / disabled';
   els.roiLength.textContent = `${roi[1].toFixed(2)} to ${roi[3].toFixed(2)} m`;
   els.roiWidth.textContent = `${roi[2].toFixed(2)} to ${roi[4].toFixed(2)} m`;
   els.roiHeight.textContent = roi[0] === 1 ? 'Yes' : 'No';
@@ -890,7 +917,9 @@ function renderTable() {
 // SKELETON_HEIGHT_M (so the figure doesn't visibly grow/shrink with noisy
 // radar height readings), same per-posture pose formulas and colors.
 let scene, camera, renderer, controls;
-let sensorMarker, bedGroup = null, floorGrid;
+let sensorMarker, bedGroup = null, floorGrid, radarBoundaryGroup = null;
+// Default configured tracking box from the supplied reference; it is not live MQTT configuration or guaranteed radar coverage.
+const DEFAULT_TRACKING_BOUNDARY = Object.freeze({ xmin: -4, xmax: 4, ymin: 0, ymax: 8, zmin: 0, zmax: 3 });
 const figures = {}; // tid -> {group, historyLine}
 
 const SKELETON_HEIGHT_M = 1.70;
@@ -920,7 +949,11 @@ function classifyModel(posture, fall) {
 }
 
 function bedDims() {
-  if (bedRoi) return { w: Math.max(0.3, bedRoi.xmax - bedRoi.xmin), l: Math.max(0.5, bedRoi.ymax - bedRoi.ymin) };
+  const c = liveOccupancy;
+  if (c && c[0] === 1 && c[3] > c[1] && c[4] > c[2]) {
+    return { w: c[3] - c[1], l: c[4] - c[2] };
+  }
+  // Figure proportions only; no bed is drawn without a valid config.
   return { w: 1.0, l: 2.0 };
 }
 
@@ -1071,8 +1104,9 @@ function disposeGroup(group) {
 }
 
 function updateTrackFigures() {
-  const groundZ = bedRoi ? bedRoi.ground_z : 0;
-  const bedTopZ = bedRoi ? bedRoi.ground_z + bedRoi.height : 0.5;
+  const groundZ = liveOccupancy ? liveOccupancy[5] : 0;
+  // Visual-only mattress height. The configuration specifies bed footprint and floor Z, not physical bed height.
+  const bedTopZ = groundZ + 0.5;
   const seen = new Set();
 
   Object.keys(tracks).forEach(tid => {
@@ -1134,6 +1168,8 @@ function initThree() {
   floorGrid = new THREE.GridHelper(16, 16, 0x2a3444, 0x1c232d);
   scene.add(floorGrid);
 
+  addRadarTrackingBoundary();
+
   const sensorGeo = new THREE.ConeGeometry(0.08, 0.18, 12);
   const sensorMat = new THREE.MeshStandardMaterial({ color: 0x6FA8FF, emissive: 0x1a3a66 });
   sensorMarker = new THREE.Mesh(sensorGeo, sensorMat);
@@ -1148,6 +1184,54 @@ function initThree() {
 // World meters (x=lateral, y=range/depth, z=height) -> three.js (X=lateral, Y=up, Z=-depth)
 function worldToThree(x, y, z, groundZ) {
   return new THREE.Vector3(x, (z ?? 0) - groundZ, -y);
+}
+
+// Render only a visual outline: do not filter tracks or modify firmware settings.
+function addRadarTrackingBoundary() {
+  if (radarBoundaryGroup) {
+    scene.remove(radarBoundaryGroup);
+    disposeGroup(radarBoundaryGroup);
+  }
+  const b = DEFAULT_TRACKING_BOUNDARY;
+  const h = 0.035; // slightly above the grid, preventing z-fighting
+  radarBoundaryGroup = new THREE.Group();
+  radarBoundaryGroup.name = 'Default radar tracking boundary (CFG)';
+  const corners = [
+    new THREE.Vector3(b.xmin, h, -b.ymin),
+    new THREE.Vector3(b.xmax, h, -b.ymin),
+    new THREE.Vector3(b.xmax, h, -b.ymax),
+    new THREE.Vector3(b.xmin, h, -b.ymax),
+    new THREE.Vector3(b.xmin, h, -b.ymin)
+  ];
+  const outline = new THREE.Line(
+    new THREE.BufferGeometry().setFromPoints(corners),
+    new THREE.LineBasicMaterial({ color: 0x22d3ee, transparent: true, opacity: 0.95, depthTest: false })
+  );
+  outline.renderOrder = 5;
+  radarBoundaryGroup.add(outline);
+  // Pale floor depicts the *default radar tracking region*, not surveyed room dimensions.
+  const roomFloor = new THREE.Mesh(
+    new THREE.PlaneGeometry(b.xmax - b.xmin, b.ymax - b.ymin),
+    new THREE.MeshBasicMaterial({ color: 0x24506c, transparent: true, opacity: 0.11, depthWrite: false, side: THREE.DoubleSide })
+  );
+  roomFloor.rotation.x = -Math.PI / 2;
+  roomFloor.position.set((b.xmin + b.xmax)/2, 0.008, -(b.ymin + b.ymax)/2);
+  radarBoundaryGroup.add(roomFloor);
+  // Short corner markers help distinguish the box from the ordinary floor grid.
+  const length = 0.35;
+  const markerPoints = [];
+  for (const x of [b.xmin, b.xmax]) {
+    for (const y of [b.ymin, b.ymax]) {
+      markerPoints.push(new THREE.Vector3(x, h, -y), new THREE.Vector3(x, h + length, -y));
+    }
+  }
+  const markers = new THREE.LineSegments(
+    new THREE.BufferGeometry().setFromPoints(markerPoints),
+    new THREE.LineBasicMaterial({ color: 0x22d3ee, transparent: true, opacity: 0.80, depthTest: false })
+  );
+  markers.renderOrder = 5;
+  radarBoundaryGroup.add(markers);
+  scene.add(radarBoundaryGroup);
 }
 
 function resizeThree() {
@@ -1174,18 +1258,15 @@ function updateBedMesh() {
     bedGroup = null;
   }
 
-  // Illustrative reference bed only. The approved firmware does NOT publish a
-  // bed ROI, calibration grid or automatic bed geometry. Never present this
-  // drawing as a detected or measured bed.
+  // IMPORTANT: TW_RADAR.OCCUPANCY is the configured BED ZONE for this product.
+  // Geometry is illustrative only. Track 'zone' always comes from radar MQTT,
+  // never from this visual or an X/Y calculation in the browser.
+  const c = liveOccupancy;
+  if (!c || c[0] !== 1 || ![c[1],c[2],c[3],c[4],c[5]].every(Number.isFinite) ||
+      c[1] >= c[3] || c[2] >= c[4]) return;
   const roi = {
-    xmin: -0.5,
-    xmax: 0.5,
-    ymin: 1.5,
-    ymax: 3.5,
-    ground_z: 0.0,
-    height: 0.5,
-    length: 2.0,
-    width: 1.0
+    xmin: c[1], ymin: c[2], xmax: c[3], ymax: c[4],
+    ground_z: c[5], height: 0.5
   };
 
   const xmin = Number(roi.xmin);
@@ -1309,8 +1390,9 @@ function updateBedMesh() {
     }
   }
 
-  // 6. Faint ROI boundary
-  const outlineY = topZ + 0.005 - groundZ;
+  // 6. Exact configured BED-ZONE footprint (not inset mattress edges).
+  // Draw at floor level to match the radar X/Y classification rectangle.
+  const outlineY = 0.045;
   const outline = new THREE.Line(
     new THREE.BufferGeometry().setFromPoints([
       new THREE.Vector3(xmin, outlineY, -ymin),
@@ -1322,11 +1404,19 @@ function updateBedMesh() {
     new THREE.LineBasicMaterial({
       color: 0xffb84d,
       transparent: true,
-      opacity: 0.35
+      opacity: 1.0,
+      depthTest: false
     })
   );
+  outline.renderOrder = 6;
   bedGroup.add(outline);
-
+  const zoneFloor = new THREE.Mesh(
+    new THREE.PlaneGeometry(bedW, bedL),
+    new THREE.MeshBasicMaterial({ color: 0xff9f1c, transparent: true, opacity: 0.14, side: THREE.DoubleSide, depthWrite: false })
+  );
+  zoneFloor.rotation.x = -Math.PI / 2;
+  zoneFloor.position.set(cx, 0.02, -(ymin + ymax) / 2);
+  bedGroup.add(zoneFloor);
   scene.add(bedGroup);
 }
 
