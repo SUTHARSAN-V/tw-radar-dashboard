@@ -174,15 +174,15 @@
         </div>
         <div class="field">
           <label>TOPIC identifier</label>
-          <input type="text" id="topicId" value="RADAR" maxlength="63">
+          <input type="text" id="topicId" value="radar" maxlength="63">
         </div>
         <div class="field">
           <label>Reader RSN (9 digits)</label>
-          <input type="text" id="readerRsn" value="120000001" maxlength="9" inputmode="numeric">
+          <input type="text" id="readerRsn" value="120000002" maxlength="9" inputmode="numeric">
         </div>
         <div class="field">
           <label>Live telemetry subscription</label>
-          <div class="topic-readonly" id="telemetryTopic">tw/r/RADAR/120000001/data</div>
+          <div class="topic-readonly" id="telemetryTopic">tw/r/radar/0012/120000002/data</div>
         </div>
         <div class="row" style="margin-bottom:5px;">
           <span><span class="status-dot off" id="connDot"></span><span id="connText">Disconnected</span></span>
@@ -255,14 +255,14 @@
       <div class="chip"><span class="chip-line" style="background:#F4C95D"></span>Track History</div>
       <div class="chip"><span class="chip-box" style="border-color:#FF9F1C"></span>Configured Bed Zone</div>
       <div class="chip"><span class="chip-box" style="border-color:#22D3EE"></span>Radar Boundary (8 × 8 m, default)</div>
-      <div style="flex:1;"></div>
+      <div style="flex:1;"></div><label style="color:#c7ceda;font-size:11px"><input type="checkbox" id="forwardPose"> Forward-only illustration</label>
       <button id="calibToggleBtn" class="secondary" style="display:none; padding:4px 10px; font-size:11px;" aria-hidden="true" tabindex="-1">Calibration unavailable</button>
     </div>
     <div class="canvas-wrap">
       <div id="threeContainer" style="position:absolute; inset:0;"></div>
       <canvas id="calibCanvas" style="position:absolute; inset:0; display:none;"></canvas>
       <div class="canvas-empty" id="canvasEmpty">Configure the broker's MQTT WebSocket endpoint and reader RSN, then click Connect to see live radar tracks.</div>
-      <div id="dragHint" style="position:absolute; bottom:8px; right:12px; color:#5b6676; font-size:10.5px;">drag to orbit · scroll to zoom</div>
+      <div id="dragHint" style="position:absolute; bottom:8px; right:12px; color:#5b6676; font-size:10.5px;">Illustrative pose · drag to orbit · scroll to zoom</div>
     </div>
   </div>
 
@@ -273,7 +273,7 @@
       <div class="card-title">PATIENT STATUS</div>
       <div class="card-sep"></div>
       <div class="card-body">
-        <div class="status-indicator" id="statusIndicator">● NO PATIENT</div>
+        <div class="status-indicator" id="statusIndicator">● NO PATIENT</div><div id="globalFallAlert" role="alert" style="display:none;background:#c62828;color:white;padding:9px;margin-top:6px;font-weight:600"></div>
       </div>
     </div>
 
@@ -304,6 +304,7 @@
           <tbody id="trackTableBody"></tbody>
         </table>
         <div class="total-tracks" id="totalTracks">Total Tracks: 0</div>
+        <div class="field" style="margin-top:10px"><label for="tidFilter">DISPLAY TID FILTER</label><select id="tidFilter" style="width:100%;padding:7px;border:1px solid #d8dee7;border-radius:3px;background:white"><option value="">All TIDs</option></select><div class="hint">Filters display only. All accepted tracks continue to be monitored.</div></div>
       </div>
     </div>
   </div>
@@ -336,6 +337,7 @@ let rawOccupancy = null; // exactly as received from /config/state
 let readerHealth = null;
 let rxPacketCount = 0;
 let selectedTid = null;
+let displayTid = "";
 
 // TID/GID identity lock:
 // 1) The first valid TID/GID is shown immediately.
@@ -351,7 +353,7 @@ let selectedTid = null;
 const TRACK_LOCK_MS = 20000;
 const TRACK_TIMEOUT_MS = 3000; // Accepted patient: remove after 3 s without packet
 const PENDING_GID_TIMEOUT_MS = 2000; // Candidate grace period for MQTT/frame jitter
-const POSTURE_LOCK_MS = 10000;
+const POSTURE_CONFIRM_FRAMES = 5;
 
 // Frozen-track watchdog:
 // If an accepted STANDING/WALKING track keeps receiving packets but its XYZ
@@ -359,14 +361,14 @@ const POSTURE_LOCK_MS = 10000;
 // Small real radar variation is allowed.
 const FROZEN_TRACK_MS = 2000;
 const FROZEN_POSITION_EPS_M = 0.01; // 1 cm per axis
-        // SITTING/LYING must remain stable for 10 s
+        // Ordinary posture changes require 5 consecutive track updates
 let primaryTid = null;
 let primaryGid = null;
 const acceptedGids = {}; // gid -> tid
 const pendingGids = {};  // gid -> { tid, firstSeen, lastSeen }
 
-// tid -> { posture, firstSeen, lastSeen }
-// Every posture uses the 10-second validation window.
+// tid -> { posture, count, lastSeen }
+// Ordinary posture transitions require consecutive matching MQTT track updates.
 const pendingPostures = {};
 let calibGrid = null;        // {phase,f1,f1_target,f2,f2_target,ground_done,ground_z,dim,cell,origin,thresh,cells:[[gx,gy,hits],...]}
 let calibCandidates = null;  // {blobs:[{cx,cy,len,wid,height,weight,pass},...]}
@@ -402,6 +404,7 @@ const els = {
   infoTid: document.getElementById('infoTid'),
   infoZone: document.getElementById('infoZone'),
   infoPosture: document.getElementById('infoPosture'),
+  infoPostureValidation: document.getElementById('infoPostureValidation'),
   infoHeight: document.getElementById('infoHeight'),
   infoSpeed: document.getElementById('infoSpeed'),
   infoPos: document.getElementById('infoPos'),
@@ -416,12 +419,12 @@ const els = {
 // Connection details persist locally, but passwords are NEVER stored.
 try {
   els.brokerUrl.value = localStorage.getItem('tw_broker_url') || '';
-  els.topicId.value = localStorage.getItem('tw_topic_identifier') || 'RADAR';
-  els.readerRsn.value = localStorage.getItem('tw_reader_rsn') || '120000001';
+  els.topicId.value = localStorage.getItem('tw_topic_identifier_0012') || 'radar';
+  els.readerRsn.value = localStorage.getItem('tw_reader_rsn_0012') || '120000002';
 } catch(e) {}
 
 function mqttBase() {
-  return `tw/r/${els.topicId.value.trim()}/${els.readerRsn.value.trim()}`;
+  return `tw/r/${els.topicId.value.trim()}/0012/${els.readerRsn.value.trim()}`;
 }
 function updateTopicPreview() {
   els.telemetryTopic.textContent = mqttBase() + '/data';
@@ -485,10 +488,10 @@ function connect() {
   }
   try {
     localStorage.setItem('tw_broker_url', url);
-    localStorage.setItem('tw_topic_identifier', topicId);
-    localStorage.setItem('tw_reader_rsn', rsn);
+    localStorage.setItem('tw_topic_identifier_0012', topicId);
+    localStorage.setItem('tw_reader_rsn_0012', rsn);
   } catch(e) {}
-  const prefix = `tw/r/${topicId}/${rsn}`;
+  const prefix = `tw/r/${topicId}/0012/${rsn}`;
   const opts = {
     connectTimeout: 10000, reconnectPeriod: 3000, clean: true,
     clientId: `TW_DASH_${rsn}_${Math.random().toString(16).slice(2,10)}`
@@ -519,7 +522,7 @@ function connect() {
     }));
   });
   session.on('reconnect', () => { if(client === session) setConnState('connecting'); });
-  session.on('close', () => { if(client === session) setConnState('off'); });
+  session.on('close', () => { if(client === session) { for (const k in pendingPostures) delete pendingPostures[k]; setConnState('off'); } });
   session.on('error', err => {
     if(client !== session) return;
     console.error('MQTT WebSocket error', err);
@@ -605,11 +608,14 @@ function copyTrackData(tid, msg, now, existing) {
     ? (t.frozenSince || now)
     : now;
 
+  const previousPosture = t.posture;
   Object.assign(t, msg, {
     tid, x, y, z,
     lastSeen: now,
     frozenSince
   });
+  t.rawPosture = normalizePosture(msg.posture);
+  t.posture = previousPosture || t.rawPosture;
   t.history.push({ x, y });
   if (t.history.length > 20) t.history.shift();
   return t;
@@ -622,38 +628,30 @@ function normalizePosture(raw) {
 
 function applyPostureValidation(tid, msg, now, track) {
   const detected = normalizePosture(msg.posture);
-  if (!detected) return;
-  // Falls are displayed immediately; only ordinary posture transitions use UI smoothing.
+  // Never delay an explicitly reported fall.
   if (msg.fall === true || detected === 'FALL') {
     track.posture = 'FALL';
+    track.fall = true;
     delete pendingPostures[tid];
     return;
   }
-
-  // Ordinary posture transitions use the existing 10-second visual confirmation.
+  if (!detected) {
+    delete pendingPostures[tid];
+    return;
+  }
   const confirmed = normalizePosture(track.posture);
-
   if (confirmed === detected) {
     delete pendingPostures[tid];
     return;
   }
-
   let p = pendingPostures[tid];
-
-  // Start/restart validation whenever a different posture is detected.
-  if (!p || p.posture !== detected) {
-    pendingPostures[tid] = {
-      posture: detected,
-      firstSeen: now,
-      lastSeen: now
-    };
-    return;
+  if (!p || p.posture !== detected || now - p.lastSeen >= TRACK_TIMEOUT_MS) {
+    p = pendingPostures[tid] = { posture: detected, count: 1, lastSeen: now };
+  } else {
+    p.count++;
+    p.lastSeen = now;
   }
-
-  p.lastSeen = now;
-
-  // Confirm only after 10 continuous seconds.
-  if ((now - p.firstSeen) >= POSTURE_LOCK_MS) {
+  if (p.count >= POSTURE_CONFIRM_FRAMES) {
     track.posture = detected;
     delete pendingPostures[tid];
   }
@@ -719,6 +717,7 @@ function onTrackMessage(msg) {
     delete pendingGids[gid];
 
     tracks[acceptedTid] = copyTrackData(acceptedTid, msg, now, tracks[acceptedTid]);
+    applyPostureValidation(acceptedTid, msg, now, tracks[acceptedTid]);
     if (selectedTid === null || !tracks[selectedTid]) selectedTid = acceptedTid;
     renderAll();
     return;
@@ -842,16 +841,40 @@ function updateCalibCard() {
 
 function postureStyle(p) { return POSTURE_STYLE[p] || POSTURE_STYLE.UNKNOWN; }
 
+function visibleTrackIds() {
+  return Object.keys(tracks).filter(tid => !displayTid || tid === displayTid);
+}
+function refreshTidFilter() {
+  const select = document.getElementById('tidFilter');
+  const ids = Object.keys(tracks).sort((a,b) => Number(a)-Number(b));
+  if (displayTid && !ids.includes(displayTid)) ids.push(displayTid);
+  const options = [['', 'All TIDs'], ...ids.map(tid => [tid, 'TID ' + tid + (tracks[tid] ? '' : ' (not active)')])];
+  if (JSON.stringify(Array.from(select.options, o => [o.value,o.textContent])) !== JSON.stringify(options)) {
+    select.replaceChildren(...options.map(([value,label]) => new Option(label,value)));
+  }
+  select.value = displayTid;
+  const fallIds = Object.keys(tracks).filter(tid => tracks[tid].fall || tracks[tid].posture === 'FALL');
+  const alert = document.getElementById('globalFallAlert');
+  alert.style.display = fallIds.length ? 'block' : 'none';
+  alert.textContent = fallIds.length ? 'FALL DETECTED — TID ' + fallIds.join(', ') : '';
+}
+document.getElementById('tidFilter').addEventListener('change', e => {
+  displayTid = e.target.value;
+  if (displayTid) selectedTid = displayTid;
+  renderAll();
+});
 function renderAll() {
+  refreshTidFilter();
   renderStatusAndInfo();
   renderTable();
   updateTrackFigures();
 }
 
 function renderStatusAndInfo() {
-  const ids = Object.keys(tracks);
+  const ids = visibleTrackIds();
   if (ids.length === 0) {
-    els.statusIndicator.textContent = NO_PATIENT.label;
+    els.statusIndicator.textContent = displayTid ? `TID ${displayTid} NOT ACTIVE` : NO_PATIENT.label;
+    els.infoPostureValidation.textContent = "—";
     els.statusIndicator.style.background = NO_PATIENT.bg;
     els.statusIndicator.style.color = NO_PATIENT.fg;
     els.infoTid.textContent = '—'; els.infoZone.textContent = '—'; els.infoPosture.textContent = '—';
@@ -859,7 +882,7 @@ function renderStatusAndInfo() {
     els.infoConf.textContent = '—'; els.infoFall.textContent = '—';
     return;
   }
-  if (!selectedTid || !tracks[selectedTid]) selectedTid = ids[0];
+  if (!ids.includes(selectedTid)) selectedTid = ids[0];
   const t = tracks[selectedTid];
   const style = postureStyle(t.posture);
   els.statusIndicator.textContent = t.fall ? POSTURE_STYLE.FALL.label : style.label;
@@ -873,8 +896,7 @@ function renderStatusAndInfo() {
     if (els.infoPostureValidation) {
       const pp = pendingPostures[selectedTid];
       if (pp) {
-        const sec = Math.min(10, Math.floor((Date.now() - pp.firstSeen) / 1000));
-        els.infoPostureValidation.textContent = pp.posture + ' ' + sec + '/10s';
+        els.infoPostureValidation.textContent = pp.posture + ' ' + pp.count + '/' + POSTURE_CONFIRM_FRAMES + ' frames';
       } else {
         els.infoPostureValidation.textContent = 'Confirmed';
       }
@@ -887,8 +909,8 @@ function renderStatusAndInfo() {
 }
 
 function renderTable() {
-  const ids = Object.keys(tracks);
-  els.totalTracks.textContent = 'Active Tracks: ' + ids.length;
+  const ids = visibleTrackIds();
+  els.totalTracks.textContent = 'Showing: ' + ids.length + ' / ' + Object.keys(tracks).length + ' active tracks';
   els.trackTableBody.innerHTML = '';
   ids.forEach(tid => {
     const t = tracks[tid];
@@ -920,6 +942,7 @@ let scene, camera, renderer, controls;
 let sensorMarker, bedGroup = null, floorGrid, radarBoundaryGroup = null;
 // Default configured tracking box from the supplied reference; it is not live MQTT configuration or guaranteed radar coverage.
 const DEFAULT_TRACKING_BOUNDARY = Object.freeze({ xmin: -4, xmax: 4, ymin: 0, ymax: 8, zmin: 0, zmax: 3 });
+const clock = new THREE.Clock();
 const figures = {}; // tid -> {group, historyLine}
 
 const SKELETON_HEIGHT_M = 1.70;
@@ -933,7 +956,9 @@ const JOINT_RADIUS = {
   wrist_L: 0.020, wrist_R: 0.020, foot_L: 0.020, foot_R: 0.020,
 };
 const BONES = [
-  ['neck','chest',0.034], ['chest','hip',0.043],
+  ['head','neck',0.027], ['neck','chest',0.034], ['chest','hip',0.043],
+  ['shoulder_L','chest',0.028], ['chest','shoulder_R',0.028],
+  ['hip_L','hip',0.030], ['hip','hip_R',0.030],
   ['shoulder_L','elbow_L',0.026], ['elbow_L','wrist_L',0.022],
   ['shoulder_R','elbow_R',0.026], ['elbow_R','wrist_R',0.022],
   ['hip_L','knee_L',0.035], ['knee_L','ankle_L',0.030], ['ankle_L','foot_L',0.022],
@@ -965,7 +990,7 @@ function computeJoints(model, x, y, z, groundZ, bedTopZ) {
   const j = {};
 
   if (model === 'STANDING' || model === 'WALKING') {
-    const ground = Math.max(0.02, z - h * 0.50);
+    const ground = groundZ + 0.02;
     const hip_z = ground + h * 0.49, chest_z = ground + h * 0.76, neck_z = ground + h * 0.84, head_z = ground + h * 0.96;
     if (model === 'STANDING') {
       const sx = h * 0.12, hx = h * 0.09;
@@ -992,8 +1017,8 @@ function computeJoints(model, x, y, z, groundZ, bedTopZ) {
       });
     }
   } else if (model === 'SITTING') {
-    const ground = Math.max(0.02, z - h * 0.40);
-    const seat_z = ground + h*0.43, chest_z = seat_z + h*0.27, neck_z = seat_z + h*0.36, head_z = seat_z + h*0.49;
+    const ground = groundZ + 0.02;
+    const seat_z = bedTopZ + 0.075, chest_z = seat_z + h*0.27, neck_z = seat_z + h*0.36, head_z = seat_z + h*0.49;
     const { w: bed_w, l: bed_l } = bedDims();
     const hw = h * Math.min(1.0, (bed_w*0.85) / Math.max(h*0.24, 0.3));
     const hd = h * Math.min(1.0, (bed_l*0.85) / Math.max(h*0.35, 0.3));
@@ -1024,7 +1049,7 @@ function computeJoints(model, x, y, z, groundZ, bedTopZ) {
       foot_L:[x-hw*0.10,hip_y-body_len*0.50,floor_z+h*0.045], foot_R:[x+hw*0.10,hip_y-body_len*0.50,floor_z+h*0.045],
     });
   } else { // FALL
-    const ground = Math.max(0.03, Math.min(z, 0.65));
+    const ground = groundZ + 0.025;
     const body_len = Math.max(h*1.30, 1.15);
     Object.assign(j, {
       head:[x+h*0.18,y-body_len*0.38,ground+h*0.12], neck:[x+h*0.10,y-body_len*0.28,ground+h*0.14],
@@ -1041,13 +1066,57 @@ function computeJoints(model, x, y, z, groundZ, bedTopZ) {
   return j;
 }
 
+function patientPose(model,t,g,top) {
+  const c=liveOccupancy, valid=c && c[0]===1 && c[3]>c[1] && c[4]>c[2];
+  let x=t.x,y=t.y;
+  const cx=valid?(c[1]+c[3])/2:x, cy=valid?(c[2]+c[4])/2:y;
+  const side=x>=cx?1:-1;
+  if(model==='LYING' && valid){x=cx;y=cy;}
+  if(model==='SITTING' && valid){x=side>0?c[3]-.14:c[1]+.14;y=Math.max(c[2]+.35,Math.min(c[4]-.35,y));}
+  if((model==='STANDING'||model==='WALKING') && valid && y>c[2]-.25 && y<c[4]+.25 && x>c[1]-.30 && x<c[3]+.30) x=side>0?c[3]+.32:c[1]-.32;
+  const j=computeJoints(model,x,y,t.z,g,valid?top:g);
+  if(model==='LYING' && valid){
+    const w=c[3]-c[1],l=c[4]-c[2];
+    const xs=Object.values(j).map(p=>p[0]),ys=Object.values(j).map(p=>p[1]);
+    const midX=(Math.min(...xs)+Math.max(...xs))/2,midY=(Math.min(...ys)+Math.max(...ys))/2;
+    const scale=Math.max(.05,Math.min(1,(w*.85-.22)/Math.max(.01,Math.max(...xs)-Math.min(...xs)),(l*.85-.22)/Math.max(.01,Math.max(...ys)-Math.min(...ys))));
+    for(const p of Object.values(j)){p[0]=cx+(p[0]-midX)*scale;p[1]=cy+(p[1]-midY)*scale;p[2]=top+.035+(p[2]-top)*scale;}
+  }
+  if(model==='SITTING' && valid){
+    for(const p of Object.values(j)){const dx=p[0]-x,dy=p[1]-y;p[0]=x+side*dy;p[1]=y-side*dx;}
+  }
+  if(model==='WALKING'){
+    const phase=performance.now()/1000*7, swing=Math.sin(phase);
+    for(const [suffix,sign] of [['L',1],['R',-1]]){
+      for(const [name,amp] of [['knee',.16],['ankle',.29],['foot',.29],['elbow',-.10],['wrist',-.18]]){
+        const p=j[name+'_'+suffix];p[1]=y+amp*swing*sign+(name==='foot'?.10:0);
+        if(name==='ankle'||name==='foot')p[2]+=Math.max(0,Math.cos(phase)*sign)*.10;
+      }
+    }
+    const hist=t.history||[], a=hist[Math.max(0,hist.length-5)];
+    if(a && Math.hypot(t.x-a.x,t.y-a.y)>.03){const angle=Math.atan2(t.x-a.x,t.y-a.y);for(const p of Object.values(j)){const dx=p[0]-x,dy=p[1]-y;p[0]=x+dx*Math.cos(angle)+dy*Math.sin(angle);p[1]=y-dx*Math.sin(angle)+dy*Math.cos(angle);}}
+  }
+  if(model==='FALL' && valid){
+    // Keep the illustrative fallen body clear of the bed if the reported centre overlaps it.
+    const ps=Object.values(j), minX=Math.min(...ps.map(p=>p[0])),maxX=Math.max(...ps.map(p=>p[0])),minY=Math.min(...ps.map(p=>p[1])),maxY=Math.max(...ps.map(p=>p[1]));
+    if(maxX>c[1] && minX<c[3] && maxY>c[2] && minY<c[4]){const d=side>0?c[3]+.12-minX:c[1]-.12-maxX;for(const p of ps)p[0]+=d;}
+  }
+  return j;
+}
+function placeSkeleton(f){
+  const j=f.joints,g=f.groundZ, children=f.group.children;let i=0;
+  for(const [a,b] of BONES){const m=children[i++];if(!m)return;const v=worldToThree(...j[a],g),w=worldToThree(...j[b],g),d=w.clone().sub(v);m.position.copy(v).add(w).multiplyScalar(.5);m.quaternion.setFromUnitVectors(new THREE.Vector3(0,1,0),d.clone().normalize());m.scale.y=d.length()/m.geometry.parameters.height;}
+  for(const k of Object.keys(JOINT_RADIUS)){children[i++].position.copy(worldToThree(...j[k],g));}
+  children[i].position.copy(worldToThree(...j.head,g)).add(new THREE.Vector3(0,.22,0));
+}
+
 function boneMesh(aWorld, bWorld, radius, material, groundZ) {
   const a = worldToThree(aWorld[0], aWorld[1], aWorld[2], groundZ);
   const b = worldToThree(bWorld[0], bWorld[1], bWorld[2], groundZ);
   const dir = new THREE.Vector3().subVectors(b, a);
   const length = dir.length();
-  if (length < 1e-4) return null;
-  const geo = new THREE.CylinderGeometry(radius, radius, length, 8);
+  if (length < 1e-4) dir.set(0,1,0);
+  const geo = new THREE.CylinderGeometry(radius, radius, Math.max(length, 1e-4), 8);
   const mesh = new THREE.Mesh(geo, material);
   mesh.position.copy(a).add(b).multiplyScalar(0.5);
   mesh.quaternion.setFromUnitVectors(new THREE.Vector3(0,1,0), dir.clone().normalize());
@@ -1106,15 +1175,18 @@ function disposeGroup(group) {
 function updateTrackFigures() {
   const groundZ = liveOccupancy ? liveOccupancy[5] : 0;
   // Visual-only mattress height. The configuration specifies bed footprint and floor Z, not physical bed height.
-  const bedTopZ = groundZ + 0.5;
+  const bedTopZ = groundZ + 0.47 + Math.max(0.015, bedDims().w * 0.012);
   const seen = new Set();
 
   Object.keys(tracks).forEach(tid => {
     const t = tracks[tid];
     seen.add(tid);
-    const model = classifyModel((t.posture || '').toUpperCase(), t.fall);
+    const detected = classifyModel((t.posture || '').toUpperCase(), t.fall);
+    const old = figures[tid];
+    const rank = {LYING:0,SITTING:1,STANDING:2,WALKING:3,FALL:4};
+    const model = document.getElementById("forwardPose").checked && old && rank[old.model] > rank[detected] ? old.model : detected;
     const colorHex = POSTURE_COLOR[model] || 0x20d47a;
-    const joints = computeJoints(model, t.x, t.y, t.z, groundZ, bedTopZ);
+    const joints = patientPose(model, t, groundZ, bedTopZ);
 
     if (figures[tid]) { scene.remove(figures[tid].group); disposeGroup(figures[tid].group); }
     const group = buildSkeletonGroup(joints, colorHex, groundZ, `T${tid} ${model}`);
@@ -1130,7 +1202,9 @@ function updateTrackFigures() {
       historyLine.geometry.setFromPoints(pts);
     }
 
-    figures[tid] = { group, historyLine };
+    figures[tid] = { group, historyLine, model, track:t, joints: old ? old.joints : joints, target:joints, groundZ, bedTopZ };
+    group.visible = historyLine.visible = !displayTid || tid === displayTid;
+    placeSkeleton(figures[tid]);
   });
 
   Object.keys(figures).forEach(tid => {
@@ -1247,6 +1321,13 @@ window.addEventListener('resize', resizeThree);
 
 function animate() {
   requestAnimationFrame(animate);
+  const dt = Math.min(0.05, clock.getDelta());
+  for (const f of Object.values(figures)) {
+    if (f.model === 'WALKING') f.target = patientPose(f.model, f.track, f.groundZ, f.bedTopZ);
+    const a = 1 - Math.exp(-dt * (f.model === 'FALL' ? 9 : 5));
+    for (const k of Object.keys(f.target)) for(let i=0;i<3;i++) f.joints[k][i] += (f.target[k][i]-f.joints[k][i])*a;
+    placeSkeleton(f);
+  }
   controls.update();
   renderer.render(scene, camera);
 }
@@ -1286,7 +1367,7 @@ function updateBedMesh() {
   const baseZ = groundZ;
   const mattressZ = baseZ + Math.min(
     roiH,
-    Math.max(0.12, Math.min(0.28, roiH * 0.42))
+    Math.max(0.12, roiH * 0.94)
   );
 
   const frameH = Math.max(0.08, Math.min(0.14, bedW * 0.08));
