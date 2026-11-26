@@ -161,20 +161,20 @@
       <div class="card-body">
         <div class="field">
           <label>Broker WebSocket URL (not TCP port 1883)</label>
-          <input type="text" id="brokerUrl" placeholder="wss://HOST:PORT/mqtt" autocomplete="url">
+          <input type="text" id="brokerUrl" value="wss://bemos.trackerwave.com:8883" placeholder="wss://HOST:PORT/mqtt" autocomplete="url">
           <div class="hint">ESP32 firmware connects to <b>most.trackerwave.com:1883</b> over MQTT/TCP. The browser must use a broker-enabled <b>ws://</b> or <b>wss://</b> endpoint. Confirm its port and path with the broker administrator.</div>
         </div>
         <div class="field">
           <label>MQTT username</label>
-          <input type="text" id="mqttUsername" placeholder="Broker username" autocomplete="username">
+          <input type="text" id="mqttUsername" value="beta" placeholder="Broker username" autocomplete="username">
         </div>
         <div class="field">
           <label>MQTT password</label>
-          <input type="password" id="mqttPassword" placeholder="Broker password (not saved)" autocomplete="off">
+          <input type="password" id="mqttPassword" value="gp2mPg" placeholder="Broker password (not saved)" autocomplete="off">
         </div>
         <div class="field">
           <label>TOPIC identifier</label>
-          <input type="text" id="topicId" value="radar" maxlength="63">
+          <input type="text" id="topicId" value="0012" maxlength="63">
         </div>
         <div class="field">
           <label>Reader RSN (9 digits)</label>
@@ -418,13 +418,13 @@ const els = {
 
 // Connection details persist locally, but passwords are NEVER stored.
 try {
-  els.brokerUrl.value = localStorage.getItem('tw_broker_url') || '';
-  els.topicId.value = localStorage.getItem('tw_topic_identifier_0012') || 'radar';
-  els.readerRsn.value = localStorage.getItem('tw_reader_rsn_0012') || '120000002';
+  els.brokerUrl.value = localStorage.getItem('tw_broker_url_preconfig') || 'wss://bemos.trackerwave.com:8883';
+  els.topicId.value = localStorage.getItem('tw_topic_identifier_preconfig') || '0012';
+  els.readerRsn.value = localStorage.getItem('tw_reader_rsn_preconfig') || '120000002';
 } catch(e) {}
 
 function mqttBase() {
-  return `tw/r/${els.topicId.value.trim()}/0012/${els.readerRsn.value.trim()}`;
+  return `tw/r/radar/${els.topicId.value.trim()}/${els.readerRsn.value.trim()}`;
 }
 function updateTopicPreview() {
   els.telemetryTopic.textContent = mqttBase() + '/data';
@@ -487,11 +487,11 @@ function connect() {
     setConnError('MQTT browser library did not load. Check your internet connection or CDN access.'); return;
   }
   try {
-    localStorage.setItem('tw_broker_url', url);
-    localStorage.setItem('tw_topic_identifier_0012', topicId);
-    localStorage.setItem('tw_reader_rsn_0012', rsn);
+    localStorage.setItem('tw_broker_url_preconfig', url);
+    localStorage.setItem('tw_topic_identifier_preconfig', topicId);
+    localStorage.setItem('tw_reader_rsn_preconfig', rsn);
   } catch(e) {}
-  const prefix = `tw/r/${topicId}/0012/${rsn}`;
+  const prefix = `tw/r/radar/${topicId}/${rsn}`;
   const opts = {
     connectTimeout: 10000, reconnectPeriod: 3000, clean: true,
     clientId: `TW_DASH_${rsn}_${Math.random().toString(16).slice(2,10)}`
